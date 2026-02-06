@@ -233,16 +233,18 @@ def notion_find_term_page_id(term: str):
     return results[0]["id"] if results else None
 
 def notion_create_news_page(published_iso: str, title: str, author: str, category: str, summary: str, url_value: str, terms: list[str]):
+    terms_text = ", ".join([t for t in terms if t]).strip()
+
     payload = {
         "parent": {"data_source_id": NEWS_DS_ID},
         "properties": {
-            NEWS_NAME["게시일"]: {"date": {"start": published_iso}},
-            NEWS_NAME["제목"]: {"title": [{"text": {"content": title}}]},
-            NEWS_NAME["작성자"]: {"rich_text": [{"text": {"content": author}}]} if author else {"rich_text": []},
-            NEWS_NAME["카테고리"]: {"select": {"name": category}},
-            NEWS_NAME["요약"]: {"rich_text": [{"text": {"content": summary}}]} if summary else {"rich_text": []},
-            NEWS_NAME["url"]: {"url": url_value},
-            NEWS_NAME["용어"]: {"multi_select": [{"name": t} for t in terms if t]},
+            NEWS_PROP["게시일"]: {"date": {"start": published_iso}},
+            NEWS_PROP["제목"]: {"title": [{"text": {"content": title}}]},
+            NEWS_PROP["작성자"]: {"rich_text": [{"text": {"content": author}}]} if author else {"rich_text": []},
+            NEWS_PROP["카테고리"]: {"select": {"name": category}},
+            NEWS_PROP["요약"]: {"rich_text": [{"text": {"content": summary}}]} if summary else {"rich_text": []},
+            NEWS_PROP["url"]: {"url": url_value},
+            NEWS_PROP["용어"]: {"rich_text": [{"text": {"content": terms_text}}]} if terms_text else {"rich_text": []},
         },
     }
     res = notion_post(f"{NOTION_API}/pages", payload)
