@@ -4,18 +4,21 @@
 """
 GitHub Actions (cron)용 Notion 뉴스 자동 업로드 파이프라인 - 단일 파일 최종본(main.py)
 
-요구사항:
+요구사항 반영:
 - Notion API 최신 버전(2025-09-03) + data_sources 기반 처리
-- DB에 data source가 여러 개일 때, "프로퍼티 스키마 매칭"으로 올바른 data_source_id 자동 선택
+- DB가 data source 2개 이상일 때 "프로퍼티 이름 + 타입"으로 올바른 data_source_id 자동 선택
 - 한국경제 RSS(경제/국제/IT) 최신 기사 3개 수집
-- 기사별 요약(2~3문장) + 핵심 용어 2개(OpenAI 사용, 없으면 폴백)
-- 뉴스 DB에 저장 + 용어 DB upsert + relation 연결
+- 기사별 요약 2~3문장 + 핵심 용어 2개(OpenAI 있으면 사용, 없으면 폴백)
+- 뉴스 DB 저장: 용어 컬럼은 "용어1, 용어2" 문자열 (rich_text)
+- 용어 DB upsert: 없으면 생성, 있으면 기존 사용
+- 용어 DB의 관련 기사(relation)에 해당 뉴스 페이지 연결
+- 아이템 처리 중 에러 발생 시 workflow도 실패(exit 1)로 끝나도록 변경(“run 성공인데 DB 변화 없음” 방지)
 
 필수 ENV:
 - NOTION_TOKEN
 
 선택 ENV:
-- OPENAI_API_KEY (있으면 요약/용어 추출 품질 향상)
+- OPENAI_API_KEY (있으면 요약/용어 추출)
 - OPENAI_MODEL (기본: gpt-4o-mini)
 
 고정 DB ID(요청값):
@@ -61,22 +64,34 @@ TERMS_DATABASE_ID = "2ff62df48421808ea7cbdbd4935f5b6b"
 RSS_FEEDS = [
     ("경제", "https://www.hankyung.com/feed/economy"),
     ("국제", "https://www.hankyung.com/feed/international"),
-    ("ai", "https://www.hankyung.com/feed/it"),  # IT·과학 → DB 선택지에 맞춰 ai로 매핑
+    ("ai", "https://www.hankyung.com/feed/it"),  # IT 피드를 ai로 매핑
 ]
 
-# News DB expected properties (names must match Notion exactly)
-NEWS_REQUIRED_PROPS = ["게시일", "제목", "작성자", "카테고리", "요약", "url", "용어"]
-
-# Terms DB expected properties
-TERMS_REQUIRED_PROPS = ["용어", "의미", "관련 기사"]
-
-# Notion select allowed values for 카테고리
 NEWS_CATEGORY_ALLOWED = {"경제", "국제", "ai", "cj"}
 
-# Basic HTTP timeouts/retries
 HTTP_TIMEOUT = 30
 NOTION_RETRY = 4
 OPENAI_RETRY = 3
+
+# -----------------------------
+# Expected typed schemas (핵심 수정)
+# -----------------------------
+
+NEWS_SCHEMA = {
+    "게시일": "date",
+    "제목": "title",
+    "작성자": "rich_text",
+    "카테고리": "select",
+    "요약": "rich_text",
+    "url": "url",
+    "용어": "rich_text",  # 멀티셀렉트 아님
+}
+
+TERMS_SCHEMA = {
+    "용어": "title",
+    "의미": "rich_text",
+    "관련 기사": "relation",
+}
 
 
 # -----------------------------
@@ -95,7 +110,7 @@ def _compact(s: str, limit: int = 5000) -> str:
     return s
 
 
-def _safe_get(d: Dict[str, Any], *keys: str, default=None):
+def _safe_get(d: Dict[str, Any], *keys: Any, default=None):
     cur: Any = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -133,7 +148,6 @@ def _to_date_iso(dt: Optional[datetime]) -> str:
 
 
 def _sleep_backoff(attempt: int):
-    # 0,1,2,3 -> 0.6, 1.2, 2.4, 4.8 (+ jitter)
     base = 0.6 * (2 ** attempt)
     time.sleep(min(6.0, base) + (0.05 * attempt))
 
@@ -147,7 +161,12 @@ class NotionHTTPError(RuntimeError):
     pass
 
 
-def notion_request(method: str, path: str, body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def notion_request(
+    method: str,
+    path: str,
+    body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     url = f"{NOTION_API_BASE}{path}"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -170,24 +189,24 @@ def notion_request(method: str, path: str, body: Optional[Dict[str, Any]] = None
                 if resp.text.strip():
                     return resp.json()
                 return {}
-            # Notion error body is JSON (usually)
+
             try:
                 err_json = resp.json()
             except Exception:
                 err_json = {"status": resp.status_code, "text": resp.text}
 
-            # Retry on rate limit / transient
+            # retryable
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = err_json
                 _sleep_backoff(attempt)
                 continue
 
-            raise NotionHTTPError(f"Notion API error {resp.status_code}: {json.dumps(err_json, ensure_ascii=False)}")
+            raise NotionHTTPError(
+                f"Notion API error {resp.status_code} {method} {path}: {json.dumps(err_json, ensure_ascii=False)}"
+            )
         except (requests.Timeout, requests.ConnectionError) as e:
             last_err = {"error": str(e)}
             _sleep_backoff(attempt)
-        except Exception:
-            raise
 
     raise NotionHTTPError(f"Notion API failed after retries: {json.dumps(last_err, ensure_ascii=False)}")
 
@@ -219,80 +238,75 @@ def notion_query_data_source(
 
 
 def notion_create_page(parent_data_source_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
-    body = {
-        "parent": {"data_source_id": parent_data_source_id},
-        "properties": properties,
-    }
+    body = {"parent": {"data_source_id": parent_data_source_id}, "properties": properties}
     return notion_request("POST", "/pages", body)
 
 
 def notion_update_page(page_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
-    body = {"properties": properties}
-    return notion_request("PATCH", f"/pages/{page_id}", body)
+    return notion_request("PATCH", f"/pages/{page_id}", {"properties": properties})
 
 
 def notion_retrieve_page(page_id: str) -> Dict[str, Any]:
     return notion_request("GET", f"/pages/{page_id}")
 
 
-def resolve_data_source_id_by_schema(database_id: str, required_prop_names: List[str]) -> str:
-    """
-    DB가 여러 data source를 가질 수 있으므로:
-    1) database.retrieve로 data_sources 목록 획득
-    2) 각 data_source.retrieve로 properties(schema) 확인
-    3) required_prop_names를 모두 포함하는 data_source_id 선택
-    """
+# -----------------------------
+# Resolve correct data_source_id (이름+타입 매칭)
+# -----------------------------
+
+
+def resolve_data_source_id_by_typed_schema(database_id: str, expected_schema: Dict[str, str]) -> str:
     db = notion_retrieve_database(database_id)
     data_sources = db.get("data_sources") or []
     if not data_sources:
         raise NotionHTTPError(f"Database has no data_sources array. database_id={database_id}")
 
-    candidates: List[Tuple[str, str]] = []
-    for ds in data_sources:
-        ds_id = ds.get("id")
-        ds_name = ds.get("name") or ""
-        if ds_id:
-            candidates.append((ds_id, ds_name))
+    candidates = [(ds.get("id"), ds.get("name") or "") for ds in data_sources if ds.get("id")]
+    if not candidates:
+        raise NotionHTTPError(f"No valid data_source ids in database. database_id={database_id}")
 
-    if len(candidates) == 1:
-        # 단일이면 그대로 사용하되, 스키마 검증은 수행
-        ds_id, ds_name = candidates[0]
-        ds_obj = notion_retrieve_data_source(ds_id)
-        ds_props = (ds_obj.get("properties") or {}).keys()
-        missing = [p for p in required_prop_names if p not in ds_props]
-        if missing:
-            raise NotionHTTPError(
-                f"Single data_source found but schema mismatch. data_source={ds_name}({ds_id}), missing={missing}"
-            )
-        return ds_id
-
-    # multiple: schema match
-    scored: List[Tuple[int, str, str, List[str]]] = []
+    scored = []
     for ds_id, ds_name in candidates:
         ds_obj = notion_retrieve_data_source(ds_id)
-        ds_props = set((ds_obj.get("properties") or {}).keys())
-        missing = [p for p in required_prop_names if p not in ds_props]
-        score = len(required_prop_names) - len(missing)
-        scored.append((score, ds_id, ds_name, missing))
+        props = ds_obj.get("properties") or {}
 
-    # pick best full match first
-    full = [x for x in scored if x[0] == len(required_prop_names)]
+        missing = []
+        type_mismatch = []
+        matched = 0
+
+        for prop_name, expected_type in expected_schema.items():
+            if prop_name not in props:
+                missing.append(prop_name)
+                continue
+            actual_type = (props[prop_name] or {}).get("type")
+            if actual_type != expected_type:
+                type_mismatch.append({"prop": prop_name, "expected": expected_type, "actual": actual_type})
+                continue
+            matched += 1
+
+        scored.append((matched, ds_id, ds_name, missing, type_mismatch))
+
+    full = [x for x in scored if x[0] == len(expected_schema)]
     if len(full) == 1:
         return full[0][1]
     if len(full) > 1:
-        # 여러 개가 완전 일치면 이름이 database 이름과 유사한 것을 우선 (그래도 안전하게 첫 번째)
         full_sorted = sorted(full, key=lambda t: (len(t[2]), t[2]))
         return full_sorted[0][1]
 
-    # no full match: fail with diagnostics
     scored_sorted = sorted(scored, key=lambda t: (-t[0], t[2]))
     diag = [
-        {"data_source_id": ds_id, "name": ds_name, "matched": score, "missing": missing}
-        for score, ds_id, ds_name, missing in scored_sorted
+        {
+            "data_source_id": ds_id,
+            "name": ds_name,
+            "matched": matched,
+            "missing": missing,
+            "type_mismatch": type_mismatch,
+        }
+        for matched, ds_id, ds_name, missing, type_mismatch in scored_sorted
     ]
     raise NotionHTTPError(
-        "Could not resolve a data_source_id by schema. "
-        f"database_id={database_id}, required={required_prop_names}, candidates={json.dumps(diag, ensure_ascii=False)}"
+        "Could not resolve a data_source_id by typed schema. "
+        f"database_id={database_id}, expected={expected_schema}, candidates={json.dumps(diag, ensure_ascii=False)}"
     )
 
 
@@ -319,20 +333,12 @@ def fetch_rss(url: str) -> str:
 
 
 def parse_rss(xml_text: str, category: str) -> List[RSSItem]:
-    """
-    한경 RSS는 item/title, item/link, item/pubDate, item/description 등을 제공.
-    author는 dc:creator/author 등에서 최대한 추출.
-    """
     try:
         root = ET.fromstring(xml_text)
     except Exception:
         return []
 
-    # namespaces handling
-    ns = {
-        "dc": "http://purl.org/dc/elements/1.1/",
-        "content": "http://purl.org/rss/1.0/modules/content/",
-    }
+    ns = {"dc": "http://purl.org/dc/elements/1.1/"}
 
     items: List[RSSItem] = []
     for item in root.findall(".//item"):
@@ -345,7 +351,6 @@ def parse_rss(xml_text: str, category: str) -> List[RSSItem]:
         if not author:
             author = (item.findtext("dc:creator", namespaces=ns) or "").strip()
 
-        # HTML 태그 제거(가벼운 수준)
         desc_plain = re.sub(r"<[^>]+>", " ", desc)
         desc_plain = _compact(desc_plain, 1200)
 
@@ -377,14 +382,11 @@ def openai_chat_json(prompt: str) -> Dict[str, Any]:
         raise OpenAIHTTPError("OPENAI_API_KEY not set")
 
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model": OPENAI_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a precise assistant that returns ONLY valid JSON."},
+            {"role": "system", "content": "You return ONLY valid JSON."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
@@ -421,22 +423,13 @@ def openai_chat_json(prompt: str) -> Dict[str, Any]:
 
 
 def summarize_and_extract_terms(title: str, url: str, snippet: str, category: str) -> Tuple[str, List[str]]:
-    """
-    returns: (summary, [term1, term2])
-    """
-    # Fallback (no OpenAI)
     if not OPENAI_API_KEY:
-        summary = _compact(snippet, 300)
-        if not summary:
-            summary = _compact(title, 300)
-        # very naive term guess: pick 2 keywords-like tokens
+        summary = _compact(snippet, 300) or _compact(title, 300)
         toks = re.findall(r"[A-Za-z가-힣0-9·\-]{2,}", f"{title} {snippet}")
-        toks = [t for t in toks if len(t) >= 2]
-        toks = _dedupe_preserve(toks)
-        terms = (toks[:2] if len(toks) >= 2 else (toks + [""] * 2)[:2])
-        terms = [t.strip() for t in terms if t.strip()]
-        if len(terms) < 2:
-            terms = (terms + ["핵심용어"])[:2]
+        toks = _dedupe_preserve([t for t in toks if len(t) >= 2])
+        terms = [t for t in toks[:2] if t.strip()]
+        while len(terms) < 2:
+            terms.append("핵심용어")
         return summary, terms[:2]
 
     prompt = f"""
@@ -448,34 +441,29 @@ def summarize_and_extract_terms(title: str, url: str, snippet: str, category: st
 - RSS 요약/설명(참고): {snippet}
 
 요구사항:
-1) 기사 내용을 추정해 2~3문장 한국어 요약을 작성한다(과장 금지, 불확실하면 "~로 전해졌다"처럼 표현).
-2) 기사에서 중요한 "핵심 용어" 2개를 뽑는다.
-   - 사람 이름만 2개 뽑는 것 금지
-   - 너무 일반적인 단어(예: 경제, 국제, 뉴스) 금지
-   - 가능한 한 명사/개념/기업/정책/기술 키워드
+1) 2~3문장 한국어 요약(과장 금지, 불확실하면 "~로 전해졌다" 등).
+2) 핵심 용어 2개:
+   - 사람 이름만 2개 금지
+   - 너무 일반적인 단어 금지
+   - 명사/개념/기업/정책/기술 위주
 
-아래 JSON 형식으로만 답해라:
+아래 JSON만 출력:
 {{
   "summary": "요약(2~3문장)",
-  "terms": ["용어1", "용어2"]
+  "terms": ["용어1","용어2"]
 }}
 """.strip()
 
     out = openai_chat_json(prompt)
-    summary = _compact(str(out.get("summary", "") or ""), 600)
+    summary = _compact(str(out.get("summary", "") or ""), 600) or (_compact(snippet, 300) or _compact(title, 300))
+
     terms_raw = out.get("terms") or []
     if not isinstance(terms_raw, list):
         terms_raw = []
-    terms = []
-    for t in terms_raw:
-        t = _compact(str(t or ""), 60)
-        if t:
-            terms.append(t)
-    terms = _dedupe_preserve(terms)[:2]
+    terms = _dedupe_preserve([_compact(str(t or ""), 60) for t in terms_raw if str(t or "").strip()])[:2]
     while len(terms) < 2:
         terms.append("핵심용어")
-    if not summary:
-        summary = _compact(snippet, 300) or _compact(title, 300)
+
     return summary, terms[:2]
 
 
@@ -523,7 +511,6 @@ def notion_find_news_by_url(news_data_source_id: str, url: str) -> Optional[str]
 
 
 def notion_find_term_page(term_data_source_id: str, term: str) -> Optional[str]:
-    # title property filter
     filter_obj = {"property": "용어", "title": {"equals": term}}
     res = notion_query_data_source(term_data_source_id, filter_obj=filter_obj, page_size=1)
     results = res.get("results") or []
@@ -544,11 +531,7 @@ def notion_get_existing_relation_ids(page_obj: Dict[str, Any], relation_prop_nam
     return _dedupe_preserve(ids)
 
 
-def upsert_term_and_link(
-    term_data_source_id: str,
-    term: str,
-    news_page_id: str,
-):
+def upsert_term_and_link(term_data_source_id: str, term: str, news_page_id: str):
     existing_id = notion_find_term_page(term_data_source_id, term)
     if not existing_id:
         props = {
@@ -560,7 +543,6 @@ def upsert_term_and_link(
         print(f"TERM created: {term} -> {created.get('id')}")
         return
 
-    # update relation (merge)
     page = notion_retrieve_page(existing_id)
     existing_rel = notion_get_existing_relation_ids(page, "관련 기사")
     if news_page_id in existing_rel:
@@ -580,26 +562,23 @@ def upsert_term_and_link(
 def main():
     print(f"[{_now_utc_iso()}] Start pipeline")
 
-    # 1) Resolve data_source_id (schema-based) to avoid multi data source errors
-    news_ds_id = resolve_data_source_id_by_schema(NEWS_DATABASE_ID, NEWS_REQUIRED_PROPS)
-    term_ds_id = resolve_data_source_id_by_schema(TERMS_DATABASE_ID, TERMS_REQUIRED_PROPS)
+    # 1) Resolve correct data_source_id (typed schema)
+    news_ds_id = resolve_data_source_id_by_typed_schema(NEWS_DATABASE_ID, NEWS_SCHEMA)
+    term_ds_id = resolve_data_source_id_by_typed_schema(TERMS_DATABASE_ID, TERMS_SCHEMA)
     print(f"Resolved news_data_source_id={news_ds_id}")
     print(f"Resolved term_data_source_id={term_ds_id}")
 
-    # 2) Fetch RSS items from 3 feeds
+    # 2) Fetch RSS items
     all_items: List[RSSItem] = []
     for cat, feed_url in RSS_FEEDS:
         if cat not in NEWS_CATEGORY_ALLOWED:
-            print(f"Skip feed (invalid category mapping): {cat} {feed_url}")
             continue
         xml_text = fetch_rss(feed_url)
         items = parse_rss(xml_text, cat)
         all_items.extend(items)
 
-    # sort by published desc, fallback to now
     all_items.sort(key=lambda x: x.published or datetime.now(timezone.utc), reverse=True)
 
-    # 3) Pick latest 3 unique links
     picked: List[RSSItem] = []
     seen_links = set()
     for it in all_items:
@@ -612,11 +591,16 @@ def main():
 
     print(f"Picked {len(picked)} items")
 
-    # 4) For each, dedupe by url in Notion and insert
+    # 3) Process items (에러가 하나라도 있으면 마지막에 실패 처리)
+    errors = 0
+    created_count = 0
+    skipped_count = 0
+
     for it in picked:
         try:
             existing_news_id = notion_find_news_by_url(news_ds_id, it.link)
             if existing_news_id:
+                skipped_count += 1
                 print(f"NEWS exists, skip: {it.link} ({existing_news_id})")
                 continue
 
@@ -630,7 +614,6 @@ def main():
 
             publish_date_iso = _to_date_iso(it.published)
 
-            # Create news page
             news_props = {
                 "게시일": prop_date(publish_date_iso),
                 "제목": prop_title(it.title),
@@ -646,20 +629,24 @@ def main():
             if not news_page_id:
                 raise NotionHTTPError(f"News page create returned no id: {created_news}")
 
+            created_count += 1
             print(f"NEWS created: {it.title} -> {news_page_id}")
 
-            # Upsert terms and link relation
             for t in terms[:2]:
                 t = (t or "").strip()
-                if not t:
-                    continue
-                upsert_term_and_link(term_ds_id, t, news_page_id)
+                if t:
+                    upsert_term_and_link(term_ds_id, t, news_page_id)
 
         except Exception as e:
-            print("ERROR processing item:", it.link, file=sys.stderr)
-            print(str(e), file=sys.stderr)
-            traceback.print_exc()
-            # continue next item
+            errors += 1
+            print(f"ERROR processing item: {it.link}", file=sys.stderr)
+            print(repr(e), file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+
+    print(f"[{_now_utc_iso()}] Summary: created={created_count}, skipped={skipped_count}, errors={errors}")
+
+    if errors:
+        sys.exit(1)
 
     print(f"[{_now_utc_iso()}] Done")
 
