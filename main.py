@@ -18,6 +18,27 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VER = "2025-09-03"
 
+def get_first_data_source_id(database_id: str) -> str:
+    r = requests.get(f"{NOTION_API}/databases/{database_id}", headers=notion_headers(), timeout=60)
+    if r.status_code >= 400:
+        print("NOTION DB RETRIEVE ERROR:", r.text)
+    r.raise_for_status()
+    db = r.json()
+
+    # Notion 2025-09-03에서 DB는 여러 data source를 가질 수 있음
+    # 응답에 data_sources(또는 child_data_source_ids 유사 구조)가 포함됨
+    data_sources = db.get("data_sources") or []
+    if data_sources:
+        return data_sources[0]["id"]
+
+    # 방어: 혹시 다른 필드명으로 올 때
+    child_ids = db.get("child_data_source_ids") or []
+    if child_ids:
+        return child_ids[0]
+
+    raise RuntimeError("No data_source_id found for database.")
+
+
 def notion_headers():
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
