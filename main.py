@@ -82,9 +82,14 @@ def notion_search_page_by_title(db_id, title):
 def notion_query_news_by_url(url_value):
     url = f"{NOTION_API}/databases/{NEWS_DB_ID}/query"
     payload = {
-        "filter": {"property": "url", "url": {"equals": url_value}}
+        "filter": {
+            "property": "url",
+            "url": {"equals": url_value}
+        }
     }
     r = requests.post(url, headers=notion_headers(), json=payload, timeout=60)
+    if r.status_code >= 400:
+        print("NOTION 400 BODY:", r.text)
     r.raise_for_status()
     results = r.json().get("results", [])
     return results[0]["id"] if results else None
