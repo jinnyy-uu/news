@@ -16,7 +16,7 @@ TERMS_DB_ID = os.environ["TERMS_DB_ID"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 NOTION_API = "https://api.notion.com/v1"
-NOTION_VER = "2022-06-28"
+NOTION_VER = "2025-09-03"
 
 def notion_headers():
     return {
