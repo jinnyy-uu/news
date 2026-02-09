@@ -58,8 +58,8 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-NEWS_DATABASE_ID = "2ff62df4842180b6944df052819a8872"
-TERMS_DATABASE_ID = "2ff62df48421808ea7cbdbd4935f5b6b"
+NEWS_DATABASE_ID = "2ff62df4842180ce94aff2b0e5708cad"   # 새 뉴스 DB
+TERMS_DATABASE_ID = "2ff62df48421808ea7cbdbd4935f5b6b"  # 용어 DB는 기존 그대로
 
 RSS_FEEDS = [
     ("경제", "https://www.hankyung.com/feed/economy"),
